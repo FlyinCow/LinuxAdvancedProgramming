@@ -40,10 +40,14 @@ typedef struct ithread_t {
 
 typedef struct tpool_t {
   int thread_count;
-  ithread_t *due;
+  int due;
   pthread_mutex_t _m;
   ithread_t *threads;
 } tpool_t;
+
+typedef struct calc_thread_arg_t {
+  int thread_index;
+} calc_thread_arg_t;
 
 static tpool_t pool;
 
@@ -84,40 +88,96 @@ return_error:
 
 void tpool_destroy(tpool_t *pool) {
   // todo: wait for all threads to finish
+  job_t *pj, *qj;
   pthread_mutex_destroy(&pool->_m);
   for (int i = 0; i < pool->thread_count; i++) {
     pthread_mutex_destroy(&pool->threads[i].mutex);
     pthread_cond_destroy(&pool->threads[i].cond);
-    // todo: cleanup job queues
+    pj = pool->threads[i].job_queue.head;
+    while (pj != NULL) {
+      qj = pj;
+      pj = pj->next;
+      free(qj);
+    }
   }
   free(pool->threads);
 }
 
 void tpool_add_jobs(tpool_t *pool, job_queue_t jobs) {
-  // require due lock
-  // require thread's lock
-  // due jobs
-  // signal thread's cond
-  // release thread's lock
-  // step on due
-  // release due lock
+  pthread_mutex_lock(&pool->_m);
+  pthread_mutex_lock(&pool->threads[pool->due].mutex);
+  if (0 == pool->threads[pool->due].job_queue.job_count) {
+    pool->threads[pool->due].job_queue.head = jobs.head;
+    pool->threads[pool->due].job_queue.tail = jobs.tail;
+    pool->threads[pool->due].job_queue.job_count = jobs.job_count;
+  } else {
+    pool->threads[pool->due].job_queue.tail->next = jobs.head;
+    pool->threads[pool->due].job_queue.job_count += jobs.job_count;
+  }
+  pthread_cond_signal(&pool->threads[pool->due].cond);
+  pthread_mutex_unlock(&pool->threads[pool->due].mutex);
+  pool->due = (pool->due + 1) % pool->thread_count;
+  pthread_mutex_unlock(&pool->_m);
 }
 
 void request_thread_exec() {
-  // spwan a few jobs
-  // add jobs to pool
+  // spwan 1~10 jobs
+  job_queue_t jobs;
+  job_t *pj;
+  int job_count = rand() % 10 + 1;
+  pj = (job_t *)malloc(sizeof(job_t));
+  pj->a = rand() % 100;
+  pj->b = rand() % 100;
+  pj->op = ADD + rand() % 4;
+  pj->next = NULL;
+  jobs.head = jobs.tail = pj;
+  for (int i = 0; i < job_count - 1; i++) {
+    pj = (job_t *)malloc(sizeof(job_t));
+    pj->a = rand() % 100;
+    pj->b = rand() % 100;
+    pj->op = ADD + rand() % 4;
+    jobs.tail = pj;
+    pj->next = NULL;
+  }
+  jobs.job_count = job_count;
+
+  tpool_add_jobs(&pool, jobs);
+  // todo:
   // aquire result's lock
   // while no result --> wait on result's cond
   // take results
   // release result's lock
 }
 
-void calc_thread_exec() {
+void calc_thread_exec(calc_thread_arg_t *calc_thread_arg) {
   // aquire self's lock
-  // while no job --> wait on self's cond
+  int my_index = calc_thread_arg->thread_index;
+  pthread_mutex_lock(&pool.threads[my_index].mutex);
+  while (pool.threads[my_index].job_queue.job_count == 0) {
+    pthread_cond_wait(&pool.threads[my_index].cond,
+                      &pool.threads[my_index].mutex);
+  }
+
   // take all jobs
-  // release self's lock
-  // calculate results
+  job_queue_t jobs;
+  jobs.head = pool.threads[my_index].job_queue.head;
+  jobs.tail = pool.threads[my_index].job_queue.tail;
+  jobs.job_count = pool.threads[my_index].job_queue.job_count;
+  pool.threads[my_index].job_queue.tail = NULL;
+  pool.threads[my_index].job_queue.head = NULL;
+  pool.threads[my_index].job_queue.job_count = 0;
+  pthread_mutex_unlock(&pool.threads[my_index].mutex);
+
+  int results[jobs.job_count];
+  job_t *pj = jobs.head;
+  job_t *qj;
+  for (int i = 0; i < jobs.job_count; i++) {
+    results[i] = calc(pj->a, pj->b, pj->op);
+    qj = pj;
+    pj = pj->next;
+    free(qj);
+  }
+  // todo:
   // aquire result's lock
   // feed results
   // signal result's cond
