@@ -1,7 +1,13 @@
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 
+// #define CALC_LOG
+#define REQST_LOG
+
 typedef enum OP { ADD, SUB, MUT, DIV } OP;
+
+static char op_char_map[] = {'+', '-', '*', '/'};
 
 int calc(int a, int b, OP op) {
   switch (op) {
@@ -41,13 +47,15 @@ typedef struct ithread_t {
 typedef struct tpool_t {
   int thread_count;
   int due;
-  pthread_mutex_t _m;
+  pthread_mutex_t _m; // for protecting _m among request threads
   ithread_t *threads;
 } tpool_t;
 
 typedef struct calc_thread_arg_t {
   int thread_index;
 } calc_thread_arg_t;
+
+void calc_thread_exec(calc_thread_arg_t *calc_thread_arg);
 
 static tpool_t pool;
 
@@ -61,7 +69,9 @@ static tpool_t pool;
 int tpool_create(tpool_t *pool, int num_threads) {
   if (num_threads <= 0)
     num_threads = 1; // at least one thread in the pool
+  printf("init pool for %d threads.\n", num_threads);
   pool->thread_count = num_threads;
+  calc_thread_arg_t *args[num_threads];
 
   if (0 != pthread_mutex_init(&pool->_m, NULL))
     goto return_error;
@@ -76,8 +86,14 @@ int tpool_create(tpool_t *pool, int num_threads) {
       goto cleanup_ithreads;
     pool->threads[i].job_queue.head = pool->threads->job_queue.tail = NULL;
     pool->threads->job_queue.job_count = 0;
+    args[i] = (calc_thread_arg_t *)malloc(sizeof(calc_thread_arg_t));
+    args[i]->thread_index = i;
+#ifdef CALC_LOG
+    printf("create thread %d\n", i);
+#endif
+    pthread_create(&pool->threads[i].thread, NULL, (void *)calc_thread_exec,
+                   (void *)args[i]);
   }
-  // todo: create threads
   return 0;
 
 cleanup_ithreads:
@@ -86,6 +102,11 @@ return_error:
   return -1;
 }
 
+/**
+ * @brief deallocate all memories inside `pool`
+ *
+ * @param pool
+ */
 void tpool_destroy(tpool_t *pool) {
   // todo: wait for all threads to finish
   job_t *pj, *qj;
@@ -103,6 +124,12 @@ void tpool_destroy(tpool_t *pool) {
   free(pool->threads);
 }
 
+/**
+ * @brief append jobs in `jobs` to next on-due thread's job queue
+ *
+ * @param pool
+ * @param jobs
+ */
 void tpool_add_jobs(tpool_t *pool, job_queue_t jobs) {
   pthread_mutex_lock(&pool->_m);
   pthread_mutex_lock(&pool->threads[pool->due].mutex);
@@ -114,6 +141,10 @@ void tpool_add_jobs(tpool_t *pool, job_queue_t jobs) {
     pool->threads[pool->due].job_queue.tail->next = jobs.head;
     pool->threads[pool->due].job_queue.job_count += jobs.job_count;
   }
+#ifdef CALC_LOG
+  printf("thread %d: current job count:%d\n", pool->due,
+         pool->threads[pool->due].job_queue.job_count);
+#endif
   pthread_cond_signal(&pool->threads[pool->due].cond);
   pthread_mutex_unlock(&pool->threads[pool->due].mutex);
   pool->due = (pool->due + 1) % pool->thread_count;
@@ -123,7 +154,7 @@ void tpool_add_jobs(tpool_t *pool, job_queue_t jobs) {
 void request_thread_exec() {
   // spwan 1~10 jobs
   job_queue_t jobs;
-  job_t *pj;
+  job_t *pj, *qj;
   int job_count = rand() % 10 + 1;
   pj = (job_t *)malloc(sizeof(job_t));
   pj->a = rand() % 100;
@@ -132,15 +163,19 @@ void request_thread_exec() {
   pj->next = NULL;
   jobs.head = jobs.tail = pj;
   for (int i = 0; i < job_count - 1; i++) {
+    qj = pj;
     pj = (job_t *)malloc(sizeof(job_t));
     pj->a = rand() % 100;
     pj->b = rand() % 100;
     pj->op = ADD + rand() % 4;
     jobs.tail = pj;
     pj->next = NULL;
+    qj->next = pj;
   }
   jobs.job_count = job_count;
-
+#ifdef REQST_LOG
+  printf("spawn %d jobs\n", job_count);
+#endif
   tpool_add_jobs(&pool, jobs);
   // todo:
   // aquire result's lock
@@ -149,30 +184,40 @@ void request_thread_exec() {
   // release result's lock
 }
 
-void calc_thread_exec(calc_thread_arg_t *calc_thread_arg) {
-  // aquire self's lock
-  int my_index = calc_thread_arg->thread_index;
-  pthread_mutex_lock(&pool.threads[my_index].mutex);
-  while (pool.threads[my_index].job_queue.job_count == 0) {
-    pthread_cond_wait(&pool.threads[my_index].cond,
-                      &pool.threads[my_index].mutex);
+void calc_thread_exec(calc_thread_arg_t *args) {
+  int me = args->thread_index;
+  free(args);
+  pthread_mutex_lock(&pool.threads[me].mutex);
+#ifdef CALC_LOG
+  printf("thread %d waiting\n", me);
+#endif
+  while (pool.threads[me].job_queue.job_count == 0) {
+    pthread_cond_wait(&pool.threads[me].cond, &pool.threads[me].mutex);
   }
-
   // take all jobs
   job_queue_t jobs;
-  jobs.head = pool.threads[my_index].job_queue.head;
-  jobs.tail = pool.threads[my_index].job_queue.tail;
-  jobs.job_count = pool.threads[my_index].job_queue.job_count;
-  pool.threads[my_index].job_queue.tail = NULL;
-  pool.threads[my_index].job_queue.head = NULL;
-  pool.threads[my_index].job_queue.job_count = 0;
-  pthread_mutex_unlock(&pool.threads[my_index].mutex);
+  jobs.head = pool.threads[me].job_queue.head;
+  jobs.tail = pool.threads[me].job_queue.tail;
+  jobs.job_count = pool.threads[me].job_queue.job_count;
+  pool.threads[me].job_queue.tail = NULL;
+  pool.threads[me].job_queue.head = NULL;
+  pool.threads[me].job_queue.job_count = 0;
+  pthread_mutex_unlock(&pool.threads[me].mutex);
+#ifdef CALC_LOG
+  printf("thread %d jobs: %d\n", me, jobs.job_count);
+#endif
 
   int results[jobs.job_count];
   job_t *pj = jobs.head;
   job_t *qj;
   for (int i = 0; i < jobs.job_count; i++) {
     results[i] = calc(pj->a, pj->b, pj->op);
+    pj = pj->next;
+  }
+
+  pj = jobs.head;
+  for (int i = 0; i < jobs.job_count; i++) {
+    printf("%d %c %d = %d\n", pj->a, op_char_map[pj->op], pj->b, results[i]);
     qj = pj;
     pj = pj->next;
     free(qj);
@@ -189,6 +234,11 @@ int main() {
   if (0 != tpool_create(&pool, 10))
     return -1;
   // create requests
-  // wait for stop
+  pthread_t request_threads[10];
+  for (int i = 0; i < 10; i++) {
+    pthread_create(&request_threads[i], NULL, (void *)request_thread_exec,
+                   NULL);
+  }
+  // todo: wait for stop
   return 0;
 }
